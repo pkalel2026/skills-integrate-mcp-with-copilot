@@ -5,14 +5,72 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
+import jwt
+from datetime import datetime, timedelta
 import os
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+# Auth configuration
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key-change-me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Simple in-memory user store (replace with DB in future)
+users = {}
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+
+def create_access_token(subject: str, expires_delta: timedelta | None = None):
+    to_encode = {"sub": subject}
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None or email not in users:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        return users[email]
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,15 +146,38 @@ def get_activities():
     return activities
 
 
+# Authentication endpoints
+@app.post("/auth/register", status_code=201)
+def register(user: UserCreate):
+    if user.email in users:
+        raise HTTPException(status_code=400, detail="User already exists")
+    hashed = get_password_hash(user.password)
+    users[user.email] = {"email": user.email, "password_hash": hashed}
+    return {"message": "user created"}
+
+
+@app.post("/auth/login", response_model=Token)
+def login(user: UserCreate):
+    stored = users.get(user.email)
+    if not stored or not verify_password(user.password, stored["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    access_token = create_access_token(subject=user.email)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+def signup_for_activity(activity_name: str, email: str, current_user: dict = Depends(get_current_user)):
+    """Sign up a student for an activity. User must be authenticated and may only sign up themselves."""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
 
     # Get the specific activity
     activity = activities[activity_name]
+
+    # Require that the authenticated user is signing up their own email
+    if email != current_user["email"]:
+        raise HTTPException(status_code=403, detail="Cannot sign up other users")
 
     # Validate student is not already signed up
     if email in activity["participants"]:
@@ -111,14 +192,18 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+def unregister_from_activity(activity_name: str, email: str, current_user: dict = Depends(get_current_user)):
+    """Unregister a student from an activity. User must be authenticated and may only unregister themselves."""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
 
     # Get the specific activity
     activity = activities[activity_name]
+
+    # Require that the authenticated user is unregistering their own email
+    if email != current_user["email"]:
+        raise HTTPException(status_code=403, detail="Cannot unregister other users")
 
     # Validate student is signed up
     if email not in activity["participants"]:
